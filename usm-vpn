@@ -233,6 +233,7 @@ def cmd_setup(args):
     txt = (PROF / "client.ovpn").read_text(errors="ignore")
     txt = re.sub(r'^\s*auth-user-pass\s*$', '# auth-user-pass (via cmdline)', txt, flags=re.M)
     txt = re.sub(r'^\s*max-routes\b.*$', '# max-routes (obsoleta en OpenVPN 2.4+)', txt, flags=re.M)
+    txt = re.sub(r'^\s*persist-key\s*$', '# persist-key (openvpn 2.6+ ya persiste claves)', txt, flags=re.M)
     (PROF / "client.ovpn").write_text(txt)
 
     m = re.search(r'^\s*remote\s+(\S+)', txt, re.M)
@@ -347,7 +348,7 @@ def cmd_connect(args):
     for _ in range(45):
         time.sleep(1); print(".", end="", flush=True)
         t = _log()
-        if "Initialization Sequence Completed" in t:
+        if ("Initialization Sequence Completed" in t) or ("Data Channel: cipher" in t):
             ok = True; break
         if re.search(r"AUTH_FAILED|Exiting due to fatal|TLS Error|Cannot resolve", t):
             print("\n❌ Fallo:\n" + "\n".join(t.splitlines()[-6:]))
@@ -356,7 +357,8 @@ def cmd_connect(args):
             sys.exit(1)
     if not ok:                       # pudo completar justo al final
         time.sleep(1)
-        if _all_pids() and "Initialization Sequence Completed" in _log():
+        lt = _log()
+        if _all_pids() and (("Initialization Sequence Completed" in lt) or ("Data Channel: cipher" in lt)):
             ok = True
     if ok:
         _mark_readable()
