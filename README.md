@@ -61,4 +61,4 @@ Borra tu perfil y certificados locales; luego puedes eliminar la carpeta del rep
 
 ## Notas
 - `connect`/`disconnect` requieren privilegios (sudo en macOS/Linux, Administrador en Windows) porque OpenVPN crea la interfaz de red.
-- **DNS interno**: en algunos sistemas OpenVPN no fija el DNS del campus automáticamente. Si resuelves IPs pero no nombres internos, dilo y se añade.
+- **DNS interno**: `usm-vpn` fija automáticamente los DNS que empuja el servidor al conectar y **restaura los tuyos al desconectar** (macOS via `networksetup`, Linux via `resolvectl`/`resolv.conf`; en Windows lo hace OpenVPN). Así los nombres internos del campus resuelven mientras estás conectado, sin dejar tu DNS sucio al salir.

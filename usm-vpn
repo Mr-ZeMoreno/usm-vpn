@@ -14,6 +14,7 @@ RT   = HOME / ".usm-vpn"          # runtime del usuario
 PROF = RT / "profile"
 RUN  = RT / "run"
 CFG  = RT / "config.json"
+DNSF = RUN / "dns.json"
 LOG  = RUN / "openvpn.log"
 PIDF = RUN / "openvpn.pid"
 TOKRE = re.compile(r'_[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')
@@ -101,6 +102,89 @@ def download_profile(server, use_gui, insecure=False):
     if ov[0].name != "client.ovpn":
         shutil.move(str(ov[0]), str(PROF / "client.ovpn"))
     print(">> Perfil descargado y extraido en", PROF)
+
+# ---------------- DNS interno (set en connect, restore en disconnect) ----------------
+def _pushed_dns(log_text):
+    return sorted(set(re.findall(r"dhcp-option DNS ([0-9.]+)", log_text)))
+
+def _mac_service():
+    dev = ""
+    try:
+        out = subprocess.run(["route","-n","get","default"],capture_output=True,text=True).stdout
+        m = re.search(r"interface:\s*(\S+)", out); dev = m.group(1) if m else ""
+    except Exception: pass
+    try:
+        order = subprocess.run(["networksetup","-listnetworkserviceorder"],capture_output=True,text=True).stdout
+        for m in re.finditer(r"\(\d+\)\s*(.+?)\n\(Hardware Port:.*?Device:\s*(\w+)\)", order):
+            if m.group(2) == dev: return m.group(1).strip()
+    except Exception: pass
+    return "Wi-Fi"
+
+def _linux_tun_iface(sample_ip):
+    try:
+        out = subprocess.run(["ip","route","get",sample_ip],capture_output=True,text=True).stdout
+        m = re.search(r"dev\s+(\S+)", out)
+        if m: return m.group(1)
+    except Exception: pass
+    return None
+
+def dns_set(dns):
+    """Aplica los DNS del VPN y guarda el estado para restaurar luego."""
+    if not dns or IS_WIN:   # Windows: openvpn aplica dhcp-option DNS por su cuenta
+        return
+    if IS_MAC:
+        svc = _mac_service()
+        if DNSF.exists():                     # reconexion tras caida: conservar el original real
+            try: saved = json.loads(DNSF.read_text()).get("saved", [])
+            except Exception: saved = []
+        else:
+            cur = subprocess.run(["networksetup","-getdnsservers",svc],capture_output=True,text=True).stdout.strip()
+            saved = [] if "aren't any" in cur else cur.split()
+        DNSF.write_text(json.dumps({"os":"mac","service":svc,"saved":saved}))
+        subprocess.run(["sudo","networksetup","-setdnsservers",svc]+dns)
+        subprocess.run(["sudo","dscacheutil","-flushcache"],stderr=subprocess.DEVNULL)
+        subprocess.run(["sudo","killall","-HUP","mDNSResponder"],stderr=subprocess.DEVNULL)
+        print(f">> DNS -> {' '.join(dns)} (en {svc}; se restaura al desconectar)")
+    else:  # Linux
+        iface = _linux_tun_iface(dns[0])
+        if shutil.which("resolvectl") and iface:
+            DNSF.write_text(json.dumps({"os":"linux","method":"resolvectl","iface":iface}))
+            subprocess.run(["sudo","resolvectl","dns",iface]+dns)
+            subprocess.run(["sudo","resolvectl","domain",iface,"~."])  # todas las consultas por el VPN
+            print(f">> DNS -> {' '.join(dns)} (via resolvectl en {iface})")
+        else:
+            rc = pathlib.Path("/etc/resolv.conf")
+            try:
+                bak = rc.read_text()
+                DNSF.write_text(json.dumps({"os":"linux","method":"resolvconf","backup":bak}))
+                new = "".join(f"nameserver {d}\n" for d in dns)
+                subprocess.run(["sudo","cp","/etc/resolv.conf","/etc/resolv.conf.usmvpn.bak"])
+                subprocess.run(["sudo","tee","/etc/resolv.conf"],input=new,text=True,stdout=subprocess.DEVNULL)
+                print(f">> DNS -> {' '.join(dns)} (/etc/resolv.conf; respaldo guardado)")
+            except Exception as e:
+                print("   (no pude fijar DNS automaticamente:", e, ")")
+
+def dns_restore():
+    if not DNSF.exists(): return
+    try: st = json.loads(DNSF.read_text())
+    except Exception: st = {}
+    try:
+        if st.get("os") == "mac":
+            svc = st.get("service","Wi-Fi"); saved = st.get("saved") or []
+            subprocess.run(["sudo","networksetup","-setdnsservers",svc]+(saved if saved else ["Empty"]))
+            subprocess.run(["sudo","dscacheutil","-flushcache"],stderr=subprocess.DEVNULL)
+            subprocess.run(["sudo","killall","-HUP","mDNSResponder"],stderr=subprocess.DEVNULL)
+            print(f">> DNS restaurado en {svc}: {' '.join(saved) if saved else 'DHCP'}")
+        elif st.get("method") == "resolvectl":
+            subprocess.run(["sudo","resolvectl","revert",st.get("iface","")])
+            print(">> DNS restaurado (resolvectl revert)")
+        elif st.get("method") == "resolvconf":
+            subprocess.run(["sudo","cp","/etc/resolv.conf.usmvpn.bak","/etc/resolv.conf"])
+            print(">> DNS restaurado (/etc/resolv.conf)")
+    except Exception as e:
+        print("   (aviso al restaurar DNS:", e, ")")
+    try: DNSF.unlink()
+    except Exception: pass
 
 def cmd_setup(args):
     prof_arg = None; ovpn_arg = None; realm = "Entra_ID_SAML"
@@ -276,6 +360,7 @@ def cmd_connect(args):
             ok = True
     if ok:
         _mark_readable()
+        dns_set(_pushed_dns(_log()))
         print("\n✅ CONECTADO.")
         return
     print("\n⚠️ Timeout. Ultimas lineas del log:\n" + "\n".join(_log().splitlines()[-8:]))
@@ -341,6 +426,7 @@ def cmd_disconnect(args):
     pids = _all_pids()
     if not pids:
         print("No hay conexion activa.")
+        dns_restore()
         try: PIDF.unlink()
         except Exception: pass
         return
@@ -355,6 +441,7 @@ def cmd_disconnect(args):
         ip = _last_vpn_ip()
         for p in _all_pids(): _kill(p, force=True)
         time.sleep(1); _route_sweep(ip)
+    dns_restore()
     for f in (PIDF, RUN / "auth.tmp"):
         try: f.unlink()
         except Exception: pass
@@ -373,6 +460,7 @@ def cmd_clean(args):
         time.sleep(1); _route_sweep(ip)
     else:
         print("Nada que limpiar.")
+    dns_restore()
     for f in (PIDF, RUN / "auth.tmp"):
         try: f.unlink()
         except Exception: pass
