@@ -39,16 +39,24 @@ def find_profile_dir():
             return c
     return None
 
+WG_OPENVPN = "/Applications/WatchGuard/WatchGuard Mobile VPN with SSL.app/Contents/Resources/openvpn"
+
 def find_openvpn():
+    # 1) standalone en el PATH
     p = shutil.which("openvpn")
     if p: return p
-    if IS_MAC:
-        b = Path("/Applications/WatchGuard/WatchGuard Mobile VPN with SSL.app/Contents/Resources/openvpn")
-        if b.exists(): return str(b)
+    # 2) rutas comunes de instalacion propia (brew suele ser keg-only, no en el PATH)
+    for c in ["/opt/homebrew/sbin/openvpn", "/opt/homebrew/bin/openvpn",
+              "/usr/local/sbin/openvpn", "/usr/local/bin/openvpn", "/usr/sbin/openvpn"]:
+        if Path(c).exists(): return c
     if IS_WIN:
-        for g in [r"C:\Program Files\OpenVPN\bin\openvpn.exe",
-                  r"C:\Program Files\WatchGuard\WatchGuard Mobile VPN with SSL\openvpn.exe"]:
+        for g in [r"C:\Program Files\OpenVPN\bin\openvpn.exe"]:
             if Path(g).exists(): return g
+    # 3) ultimo recurso: el openvpn que trae WatchGuard (dependencia a evitar)
+    if IS_MAC and Path(WG_OPENVPN).exists(): return WG_OPENVPN
+    if IS_WIN:
+        wg = r"C:\Program Files\WatchGuard\WatchGuard Mobile VPN with SSL\openvpn.exe"
+        if Path(wg).exists(): return wg
     return None
 
 def parse_refs(ovpn_text):
@@ -151,6 +159,9 @@ def cmd_setup(args):
     CFG.write_text(json.dumps(cfg, indent=2))
     print(f"✅ Configurado.  Servidor: {server}   Realm: {realm}")
     print(f"   openvpn: {ovpn or 'NO ENCONTRADO — instalalo (ver: usm-vpn info)'}")
+    if ovpn == WG_OPENVPN:
+        print("   ⚠️  Estas usando el openvpn de WatchGuard. Para independizarte del todo:")
+        print("       macOS: brew install openvpn   (luego repite: usm-vpn setup)")
     if IS_MAC and shutil.which("swiftc") and (RT/'saml-login.swift').exists():
         try:
             subprocess.run(["swiftc","-O",str(RT/'saml-login.swift'),"-o",str(RT/'saml-login')],check=True)
@@ -226,6 +237,8 @@ def cmd_connect(args):
     cmd = [cfg["openvpn"], "--config", "client.ovpn", "--auth-user-pass", str(auth),
            "--auth-retry", "nointeract",
            "--log", str(LOG), "--writepid", str(PIDF)]
+    if _ovpn_version(cfg["openvpn"]) >= (2, 5):   # 2.5+ ignora 'cipher'; reactivamos CBC
+        cmd += ["--data-ciphers", "AES-256-CBC:AES-256-GCM:AES-128-GCM"]
     print(">> Levantando el tunel" + ("" if IS_WIN else " (puede pedir tu contraseña de sudo)") + "...")
     if IS_WIN:
         subprocess.Popen(cmd, cwd=str(PROF), creationflags=0x00000008)  # DETACHED_PROCESS
@@ -257,6 +270,14 @@ def cmd_connect(args):
             except Exception: pass
             sys.exit(1)
     print("\n⚠️ Timeout. Ultimas lineas del log:\n" + "\n".join(_log().splitlines()[-8:]))
+
+def _ovpn_version(path):
+    try:
+        out = subprocess.run([path,"--version"],capture_output=True,text=True).stdout
+        m = re.search(r'OpenVPN (\d+)\.(\d+)', out)
+        if m: return (int(m.group(1)), int(m.group(2)))
+    except Exception: pass
+    return (0,0)
 
 def _ovpn_pids():
     """PIDs de openvpn que usan NUESTRO perfil (client.ovpn)."""
