@@ -1,0 +1,8 @@
+# nunca subir datos personales ni runtime
+.usm-vpn/
+profile/
+*.ovpn
+*.crt
+*.pem
+*.key
+run/

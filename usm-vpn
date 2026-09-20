@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+# usm-vpn — cliente SSLVPN multiplataforma para la VPN de la USM (WatchGuard/OpenVPN + SAML).
+# Mac / Linux / Windows.  Sin datos personales: cada quien usa SU propio perfil y certificados.
+#   usm-vpn setup        prepara el perfil (localiza tu WatchGuard o pasa --profile / --openvpn)
+#   usm-vpn connect      login SAML (pegar URL; o --gui en Mac) y levanta el tunel
+#   usm-vpn disconnect   cierra el tunel de forma limpia
+#   usm-vpn status       muestra si estas conectado
+#   usm-vpn info         muestra la configuracion y notas por SO
+import os, sys, re, json, time, shutil, signal, subprocess, platform, webbrowser, urllib.parse
+from pathlib import Path
+
+HOME = Path.home()
+RT   = HOME / ".usm-vpn"          # runtime del usuario
+PROF = RT / "profile"
+RUN  = RT / "run"
+CFG  = RT / "config.json"
+LOG  = RUN / "openvpn.log"
+PIDF = RUN / "openvpn.pid"
+TOKRE = re.compile(r'_[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')
+IS_WIN = platform.system() == "Windows"
+IS_MAC = platform.system() == "Darwin"
+
+def die(msg, code=1):
+    print(f"❌ {msg}"); sys.exit(code)
+
+def load_cfg():
+    if not CFG.exists(): die("No hay configuracion. Ejecuta primero:  usm-vpn setup")
+    return json.loads(CFG.read_text())
+
+# ---------------- SETUP ----------------
+def find_profile_dir():
+    cands = []
+    if IS_MAC:  cands.append(HOME / "Library/WatchGuard/Mobile VPN")
+    if IS_WIN:  cands.append(Path(os.environ.get("USERPROFILE", HOME)) / "AppData/Roaming/WatchGuard/Mobile VPN")
+    cands += [HOME / ".watchguard", HOME / "WatchGuard"]
+    for c in cands:
+        if c.exists() and any(c.glob("*.ovpn")):
+            return c
+    return None
+
+def find_openvpn():
+    p = shutil.which("openvpn")
+    if p: return p
+    if IS_MAC:
+        b = Path("/Applications/WatchGuard/WatchGuard Mobile VPN with SSL.app/Contents/Resources/openvpn")
+        if b.exists(): return str(b)
+    if IS_WIN:
+        for g in [r"C:\Program Files\OpenVPN\bin\openvpn.exe",
+                  r"C:\Program Files\WatchGuard\WatchGuard Mobile VPN with SSL\openvpn.exe"]:
+            if Path(g).exists(): return g
+    return None
+
+def parse_refs(ovpn_text):
+    refs = []
+    for key in ("ca", "cert", "key", "tls-auth", "tls-crypt"):
+        m = re.search(rf'^\s*{key}\s+(\S+)', ovpn_text, re.M)
+        if m and not m.group(1).startswith("["):
+            refs.append(m.group(1))
+    return refs
+
+def cmd_setup(args):
+    prof_arg = None; ovpn_arg = None; realm = "Entra_ID_SAML"
+    it = iter(args)
+    for a in it:
+        if a == "--profile": prof_arg = next(it, None)
+        elif a == "--openvpn": ovpn_arg = next(it, None)
+        elif a == "--realm": realm = next(it, None)
+    PROF.mkdir(parents=True, exist_ok=True); RUN.mkdir(parents=True, exist_ok=True)
+
+    # localizar el .ovpn
+    src_ovpn = None; src_dir = None
+    if prof_arg:
+        p = Path(prof_arg).expanduser()
+        if p.is_dir(): src_dir = p; g = list(p.glob("*.ovpn")); src_ovpn = g[0] if g else None
+        elif p.suffix == ".ovpn": src_ovpn = p; src_dir = p.parent
+    else:
+        d = find_profile_dir()
+        if d: src_dir = d; g = list(d.glob("*.ovpn")); src_ovpn = g[0] if g else None
+    if not src_ovpn or not src_ovpn.exists():
+        die("No encontre tu perfil .ovpn. Instala/conecta una vez el cliente WatchGuard, "
+            "o pasa la ruta:  usm-vpn setup --profile /ruta/a/tu/perfil")
+
+    text = src_ovpn.read_text(errors="ignore")
+    shutil.copy(src_ovpn, PROF / "client.ovpn")
+    for ref in parse_refs(text):              # copiar certs referenciados (si no van inline)
+        rp = (src_dir / ref) if src_dir else Path(ref)
+        if rp.exists(): shutil.copy(rp, PROF / Path(ref).name)
+
+    # quitar auth-user-pass interactivo (lo damos por archivo)
+    txt = (PROF / "client.ovpn").read_text(errors="ignore")
+    txt = re.sub(r'^\s*auth-user-pass\s*$', '# auth-user-pass (via cmdline)', txt, flags=re.M)
+    txt = re.sub(r'^\s*max-routes\b.*$', '# max-routes (obsoleta en OpenVPN 2.4+)', txt, flags=re.M)
+    (PROF / "client.ovpn").write_text(txt)
+
+    m = re.search(r'^\s*remote\s+(\S+)', txt, re.M)
+    if not m: die("El perfil no tiene linea 'remote'. ¿Es un .ovpn valido?")
+    server = m.group(1)
+
+    ovpn = ovpn_arg or find_openvpn()
+    cfg = {"server": server, "realm": realm, "openvpn": ovpn}
+    CFG.write_text(json.dumps(cfg, indent=2))
+    print(f"✅ Configurado.  Servidor: {server}   Realm: {realm}")
+    print(f"   openvpn: {ovpn or 'NO ENCONTRADO — instalalo (ver: usm-vpn info)'}")
+    if IS_MAC and shutil.which("swiftc") and (RT/'saml-login.swift').exists():
+        try:
+            subprocess.run(["swiftc","-O",str(RT/'saml-login.swift'),"-o",str(RT/'saml-login')],check=True)
+            print("   modo --gui disponible (Mac).")
+        except Exception: pass
+
+# ---------------- TOKEN (login SAML) ----------------
+def get_token_paste(server):
+    url = f"https://{server}/auth/saml/login?from=sslvpn_client"
+    print("="*62); print(" LOGIN SAML — USM VPN"); print("="*62)
+    print("\n 1) Se abrira tu navegador. Haz login + MFA.")
+    print(" 2) Al terminar llegaras a una pagina de exito: copia la URL")
+    print("    COMPLETA de la barra de direcciones (contiene 'token=') y pegala.\n")
+    try: webbrowser.open(url)
+    except Exception: pass
+    print(f"    (Si no se abrio solo:  {url} )\n")
+    pasted = input(" URL de exito (o token) > ").strip()
+    tok = TOKRE.search(pasted); tok = tok.group(0) if tok else None
+    um = re.search(r'user=([^&]+)', pasted); user = urllib.parse.unquote(um.group(1)) if um else None
+    if tok and not user:
+        user = input(" Tu correo (usuario@usm.cl): ").strip()
+    return user, tok
+
+def get_token_gui(server):
+    helper = RT / "saml-login"
+    if not helper.exists(): die("Modo --gui no disponible aqui. Usa el modo normal (pegar URL).")
+    url = f"https://{server}/auth/saml/login?from=sslvpn_client"
+    out = RUN / "cred.tmp"
+    r = subprocess.run([str(helper), str(out), url, "sslvpn_success.shtml"])
+    if r.returncode != 0 or not out.exists(): die("Login cancelado o fallido.")
+    d = dict(l.split("=",1) for l in out.read_text().splitlines() if "=" in l)
+    try: out.unlink()
+    except Exception: pass
+    return d.get("USER"), d.get("TOKEN")
+
+# ---------------- CONNECT / DISCONNECT / STATUS ----------------
+def is_running():
+    if not PIDF.exists(): return None
+    try: pid = int(PIDF.read_text().strip())
+    except Exception: return None
+    try:
+        if IS_WIN:
+            out = subprocess.run(["tasklist","/FI",f"PID eq {pid}"],capture_output=True,text=True).stdout
+            return pid if str(pid) in out else None
+        os.kill(pid, 0); return pid
+    except PermissionError: return pid   # existe pero es de root: cuenta como activo
+    except Exception: return None
+
+def cmd_connect(args):
+    cfg = load_cfg()
+    if _all_pids():                       # deteccion robusta (pgrep + pidfile): NO matar a ciegas
+        print("Ya hay una conexion (o un tunel previo) activa.")
+        print("Usa:  usm-vpn reconnect   (reconectar)   o   usm-vpn disconnect")
+        return
+    if not cfg.get("openvpn"): die("No hay openvpn configurado. Instalalo y repite setup (ver: usm-vpn info).")
+    mode = args[0] if args else ""
+    user, tok = (get_token_gui if mode=="--gui" else get_token_paste)(cfg["server"])
+    if not (user and tok): die("No obtuve usuario/token.")
+    print(f">> Credenciales listas para {user} (token {tok[:10]}...).")
+
+    auth = RUN / "auth.tmp"
+    auth.write_text(f'{cfg["realm"]}\\{user}\n{tok}\n')
+    try: os.chmod(auth, 0o600)
+    except Exception: pass
+
+    # limpiar log/pid previos (pueden haber quedado como root de una conexion anterior)
+    if not IS_WIN and os.geteuid() != 0:
+        subprocess.run(["sudo", "rm", "-f", str(LOG), str(PIDF)])
+    else:
+        for f in (LOG, PIDF):
+            try: f.unlink()
+            except Exception: pass
+    cmd = [cfg["openvpn"], "--config", "client.ovpn", "--auth-user-pass", str(auth),
+           "--auth-retry", "nointeract",
+           "--log", str(LOG), "--writepid", str(PIDF)]
+    print(">> Levantando el tunel" + ("" if IS_WIN else " (puede pedir tu contraseña de sudo)") + "...")
+    if IS_WIN:
+        subprocess.Popen(cmd, cwd=str(PROF), creationflags=0x00000008)  # DETACHED_PROCESS
+    else:
+        cmd += ["--daemon"]                       # openvpn se va a background tras arrancar
+        if os.geteuid() != 0: cmd = ["sudo"] + cmd  # sudo pide contraseña en la terminal
+        subprocess.run(cmd, cwd=str(PROF))
+        # openvpn crea log/pid como root; hazlos legibles para poder monitorizar
+        if os.geteuid() != 0:
+            time.sleep(1)
+            subprocess.run(["sudo", "chmod", "644", str(LOG), str(PIDF)],
+                           stderr=subprocess.DEVNULL)
+
+    def _log():
+        try: return LOG.read_text(errors="ignore")
+        except Exception: return ""
+    print(" Conectando", end="", flush=True)
+    for _ in range(30):
+        time.sleep(1); print(".", end="", flush=True)
+        t = _log()
+        if "Initialization Sequence Completed" in t:
+            if not IS_WIN and os.geteuid() != 0:
+                subprocess.run(["sudo","chmod","644",str(PIDF),str(LOG)],stderr=subprocess.DEVNULL)
+            print("\n✅ CONECTADO.")
+            return
+        if re.search(r"AUTH_FAILED|Exiting due to fatal|TLS Error|Cannot resolve", t):
+            print("\n❌ Fallo:\n" + "\n".join(t.splitlines()[-6:]))
+            try: auth.unlink()
+            except Exception: pass
+            sys.exit(1)
+    print("\n⚠️ Timeout. Ultimas lineas del log:\n" + "\n".join(_log().splitlines()[-8:]))
+
+def _ovpn_pids():
+    """PIDs de openvpn que usan NUESTRO perfil (client.ovpn)."""
+    pids = set()
+    try:
+        if IS_WIN:
+            out = subprocess.run(["wmic","process","where","name=\'openvpn.exe\'",
+                                  "get","ProcessId,CommandLine","/format:csv"],
+                                 capture_output=True, text=True).stdout
+            for line in out.splitlines():
+                if "client.ovpn" in line:
+                    tail = line.strip().split(",")[-1]
+                    if tail.isdigit(): pids.add(int(tail))
+        else:
+            out = subprocess.run(["pgrep","-f","client.ovpn"],capture_output=True,text=True).stdout
+            for l in out.split():
+                if l.strip().isdigit(): pids.add(int(l))
+    except Exception: pass
+    return pids
+
+def _kill(pid, force=False):
+    try:
+        if IS_WIN:
+            subprocess.run(["taskkill","/PID",str(pid)]+(["/F"] if force else []),capture_output=True)
+        elif os.geteuid()==0:
+            os.kill(pid, signal.SIGKILL if force else signal.SIGTERM)
+        else:
+            subprocess.run(["sudo","kill","-9" if force else "-15",str(pid)])
+    except Exception: pass
+
+def _last_vpn_ip():
+    try:
+        m = re.findall(r'ifconfig\s+\S+\s+([0-9.]+)', LOG.read_text(errors="ignore"))
+        return m[-1] if m else ""
+    except Exception: return ""
+
+def _route_sweep(vpn_ip):
+    """Solo tras un cierre forzado: quita la ruta /24 del pool (POSIX)."""
+    if IS_WIN or not vpn_ip: return
+    net = ".".join(vpn_ip.split(".")[:3]) + ".0/24"
+    try:
+        if IS_MAC: subprocess.run(["sudo","route","-n","delete","-net",net],capture_output=True)
+        else:      subprocess.run(["sudo","ip","route","del",net],capture_output=True)
+    except Exception: pass
+
+def _all_pids():
+    s = _ovpn_pids(); r = is_running()
+    if r: s.add(r)
+    return s
+
+def cmd_disconnect(args):
+    pids = _all_pids()
+    if not pids:
+        print("No hay conexion activa.")
+        try: PIDF.unlink()
+        except Exception: pass
+        return
+    print(">> Cerrando tunel (limpio)...")
+    for p in pids: _kill(p, force=False)      # SIGTERM: openvpn limpia rutas/interfaz solo
+    gone = False
+    for _ in range(6):
+        time.sleep(1)
+        if not _all_pids(): gone = True; break
+    if not gone:
+        print("   (no cerro solo; forzando y barriendo restos)")
+        ip = _last_vpn_ip()
+        for p in _all_pids(): _kill(p, force=True)
+        time.sleep(1); _route_sweep(ip)
+    for f in (PIDF, RUN / "auth.tmp"):
+        try: f.unlink()
+        except Exception: pass
+    print(">> Desconectado.")
+
+def cmd_reconnect(args):
+    cmd_disconnect([]); time.sleep(1); cmd_connect(args)
+
+def cmd_clean(args):
+    """Barrido de emergencia (equivalente al watchdog): mata huerfanos y limpia restos."""
+    pids = _all_pids()
+    if pids:
+        print(f">> Limpiando {len(pids)} proceso(s)...")
+        ip = _last_vpn_ip()
+        for p in pids: _kill(p, force=True)
+        time.sleep(1); _route_sweep(ip)
+    else:
+        print("Nada que limpiar.")
+    for f in (PIDF, RUN / "auth.tmp"):
+        try: f.unlink()
+        except Exception: pass
+    print(">> Limpio.")
+
+def cmd_status(args):
+    cfg = CFG.exists() and json.loads(CFG.read_text()) or {}
+    pids = _all_pids()
+    pid = min(pids) if pids else None
+    if pid:
+        ip = ""
+        try:
+            m = re.findall(r'ifconfig\s+\S+\s+([0-9.]+)', LOG.read_text(errors="ignore"))
+            if m: ip = m[-1]
+        except Exception: pass
+        print(f"🟢 CONECTADO  (pid {pid})")
+        print(f"   Servidor: {cfg.get('server','?')}")
+        if ip: print(f"   IP VPN:   {ip}")
+    else:
+        print("🔴 DESCONECTADO")
+
+def cmd_info(args):
+    cfg = CFG.exists() and json.loads(CFG.read_text()) or {}
+    print("USM VPN — info")
+    print(f"  SO:        {platform.system()} {platform.machine()}")
+    print(f"  Servidor:  {cfg.get('server','(sin setup)')}")
+    print(f"  Realm:     {cfg.get('realm','?')}")
+    print(f"  openvpn:   {cfg.get('openvpn') or '(no encontrado)'}")
+    print(f"  Perfil:    {PROF if PROF.exists() else '(sin setup)'}")
+    print("\n  Requisito por SO para instalar openvpn:")
+    print("    macOS:   brew install openvpn   (o usa el de WatchGuard)")
+    print("    Linux:   sudo apt install openvpn   /   sudo dnf install openvpn")
+    print("    Windows: winget install OpenVPN.OpenVPN  (ejecuta la terminal como Administrador)")
+    print("\n  Nota: necesitas TU propio perfil (.ovpn + certificados) de tu cuenta USM.")
+
+def main():
+    cmds = {"setup":cmd_setup,"connect":cmd_connect,"disconnect":cmd_disconnect,
+            "reconnect":cmd_reconnect,"status":cmd_status,"info":cmd_info,"clean":cmd_clean}
+    if len(sys.argv) < 2 or sys.argv[1] not in cmds:
+        print("Uso: usm-vpn {setup|connect|disconnect|reconnect|status|info|clean}")
+        print("     usm-vpn connect [--gui]        (--gui solo en Mac)")
+        print("     usm-vpn reconnect [--gui]      desconecta y vuelve a conectar")
+        print("     usm-vpn clean                  mata cualquier tunel huerfano (cierre de emergencia)")
+        print("     usm-vpn setup [--profile RUTA] [--openvpn RUTA] [--realm NOMBRE]")
+        sys.exit(0 if len(sys.argv)<2 else 1)
+    cmds[sys.argv[1]](sys.argv[2:])
+
+if __name__ == "__main__":
+    main()
