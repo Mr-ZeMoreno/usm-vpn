@@ -379,14 +379,42 @@ def cmd_info(args):
     print("\n  Perfil: si NO tienes WatchGuard (Linux), descarga el tuyo con:")
     print("          usm-vpn setup --download        (hara login SAML y lo baja del Firebox)")
 
+def cmd_uninstall(args):
+    yes = ("--yes" in args) or ("-y" in args)
+    if not yes:
+        try:
+            r = input("Esto desconectara la VPN y borrara ~/.usm-vpn (incluye TUS certificados). "
+                      "¿Seguro? [y/N] ").strip().lower()
+        except EOFError:
+            r = "n"
+        if r not in ("y","yes","s","si"):
+            print("Cancelado."); return
+    print(">> Desconectando (si hay conexion)...")
+    try: cmd_disconnect(["--quiet"])
+    except Exception: pass
+    if not IS_WIN:
+        for link in ("/usr/local/bin/usm-vpn", str(HOME/".local/bin/usm-vpn")):
+            lp = Path(link)
+            try:
+                if lp.is_symlink() or lp.exists():
+                    if os.access(lp.parent, os.W_OK): lp.unlink()
+                    else: subprocess.run(["sudo","rm","-f",str(lp)])
+                    print("   enlace quitado:", link)
+            except Exception: pass
+    shutil.rmtree(RT, ignore_errors=True)
+    print("   borrado:", RT)
+    print(">> usm-vpn desinstalado. (Si clonaste el repo, borra esa carpeta a mano.)")
+
 def main():
     cmds = {"setup":cmd_setup,"connect":cmd_connect,"disconnect":cmd_disconnect,
-            "reconnect":cmd_reconnect,"status":cmd_status,"info":cmd_info,"clean":cmd_clean}
+            "reconnect":cmd_reconnect,"status":cmd_status,"info":cmd_info,"clean":cmd_clean,
+            "uninstall":cmd_uninstall}
     if len(sys.argv) < 2 or sys.argv[1] not in cmds:
-        print("Uso: usm-vpn {setup|connect|disconnect|reconnect|status|info|clean}")
+        print("Uso: usm-vpn {setup|connect|disconnect|reconnect|status|info|clean|uninstall}")
         print("     usm-vpn connect [--gui]        (--gui solo en Mac)")
         print("     usm-vpn reconnect [--gui]      desconecta y vuelve a conectar")
         print("     usm-vpn clean                  mata cualquier tunel huerfano (cierre de emergencia)")
+        print("     usm-vpn uninstall [-y]         desconecta, quita el enlace y borra ~/.usm-vpn")
         print("     usm-vpn setup                  autodetecta perfil de WatchGuard (Mac/Win)")
         print("     usm-vpn setup --download [--gui]  descarga tu perfil via SAML (Linux/sin WatchGuard)")
         print("     usm-vpn setup --profile RUTA   usa un .ovpn que ya tengas")

@@ -52,6 +52,13 @@ usm-vpn setup          Vuelve a preparar el perfil
 
 > El token es de un solo uso: cada conexión necesita un login nuevo (así es SAML).
 
+## Desinstalar
+```bash
+usm-vpn uninstall        # desconecta, quita el enlace del PATH y borra ~/.usm-vpn
+```
+O con el script: `./uninstall.sh`. En Windows: `python usm-vpn uninstall`.
+Borra tu perfil y certificados locales; luego puedes eliminar la carpeta del repo clonado.
+
 ## Notas
 - `connect`/`disconnect` requieren privilegios (sudo en macOS/Linux, Administrador en Windows) porque OpenVPN crea la interfaz de red.
 - **DNS interno**: en algunos sistemas OpenVPN no fija el DNS del campus automáticamente. Si resuelves IPs pero no nombres internos, dilo y se añade.
