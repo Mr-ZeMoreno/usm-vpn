@@ -255,20 +255,29 @@ def cmd_connect(args):
     def _log():
         try: return LOG.read_text(errors="ignore")
         except Exception: return ""
+    def _mark_readable():
+        if not IS_WIN and os.geteuid() != 0:
+            subprocess.run(["sudo","chmod","644",str(PIDF),str(LOG)],stderr=subprocess.DEVNULL)
     print(" Conectando", end="", flush=True)
-    for _ in range(30):
+    ok = False
+    for _ in range(45):
         time.sleep(1); print(".", end="", flush=True)
         t = _log()
         if "Initialization Sequence Completed" in t:
-            if not IS_WIN and os.geteuid() != 0:
-                subprocess.run(["sudo","chmod","644",str(PIDF),str(LOG)],stderr=subprocess.DEVNULL)
-            print("\n✅ CONECTADO.")
-            return
+            ok = True; break
         if re.search(r"AUTH_FAILED|Exiting due to fatal|TLS Error|Cannot resolve", t):
             print("\n❌ Fallo:\n" + "\n".join(t.splitlines()[-6:]))
             try: auth.unlink()
             except Exception: pass
             sys.exit(1)
+    if not ok:                       # pudo completar justo al final
+        time.sleep(1)
+        if _all_pids() and "Initialization Sequence Completed" in _log():
+            ok = True
+    if ok:
+        _mark_readable()
+        print("\n✅ CONECTADO.")
+        return
     print("\n⚠️ Timeout. Ultimas lineas del log:\n" + "\n".join(_log().splitlines()[-8:]))
 
 def _ovpn_version(path):
