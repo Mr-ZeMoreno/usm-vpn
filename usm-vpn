@@ -19,6 +19,7 @@ PIDF = RUN / "openvpn.pid"
 TOKRE = re.compile(r'_[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')
 IS_WIN = platform.system() == "Windows"
 IS_MAC = platform.system() == "Darwin"
+DEFAULT_SERVER = "accede.usm.cl"
 
 def die(msg, code=1):
     print(f"❌ {msg}"); sys.exit(code)
@@ -58,33 +59,83 @@ def parse_refs(ovpn_text):
             refs.append(m.group(1))
     return refs
 
+def download_profile(server, use_gui, insecure=False):
+    import io, tarfile, ssl, urllib.request
+    print(">> Para descargar tu perfil necesito tu login SAML (es tu cuenta USM).")
+    user, tok = (get_token_gui if use_gui else get_token_paste)(server)
+    if not (user and tok): die("No obtuve token; no puedo descargar el perfil.")
+    fw_user = urllib.parse.quote("Entra_ID_SAML\\" + user)
+    url = (f"https://{server}/?action=sslvpn_download&filename=client.wgssl"
+           f"&fw_password={urllib.parse.quote(tok)}&fw_username={fw_user}")
+    print(">> Descargando perfil del Firebox...")
+    ctx = ssl._create_unverified_context() if insecure else ssl.create_default_context()
+    try:
+        data = urllib.request.urlopen(url, timeout=30, context=ctx).read()
+    except ssl.SSLError:
+        die("El portal presenta un certificado no verificable. Si confias en la red, "
+            "reintenta:  usm-vpn setup --download --insecure")
+    if len(data) < 200 or data[:15].lstrip().startswith(b"<"):
+        die("La descarga no parece un perfil (¿token vencido o usuario incorrecto?). Reintenta.")
+    # extraer el paquete (tgz/tar) en PROF
+    ok = False
+    try:
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as tf:
+            tf.extractall(PROF); ok = True
+    except Exception: ok = False
+    if ok:  # aplanar si quedo en subcarpeta
+        for f in list(PROF.rglob("*")):
+            if f.is_file() and f.suffix in (".ovpn",".crt",".pem",".key") and f.parent != PROF:
+                shutil.move(str(f), str(PROF / f.name))
+    ov = list(PROF.glob("*.ovpn"))
+    if not ov:
+        die("No pude extraer un .ovpn del paquete. Descarga el perfil del portal a mano "
+            "y usa:  usm-vpn setup --profile <ruta>")
+    if ov[0].name != "client.ovpn":
+        shutil.move(str(ov[0]), str(PROF / "client.ovpn"))
+    print(">> Perfil descargado y extraido en", PROF)
+
 def cmd_setup(args):
     prof_arg = None; ovpn_arg = None; realm = "Entra_ID_SAML"
+    server_arg = None; do_dl = False; use_gui = False; insecure = False
     it = iter(args)
     for a in it:
         if a == "--profile": prof_arg = next(it, None)
         elif a == "--openvpn": ovpn_arg = next(it, None)
         elif a == "--realm": realm = next(it, None)
+        elif a == "--server": server_arg = next(it, None)
+        elif a == "--download": do_dl = True
+        elif a == "--gui": use_gui = True
+        elif a == "--insecure": insecure = True
     PROF.mkdir(parents=True, exist_ok=True); RUN.mkdir(parents=True, exist_ok=True)
+    # compilar el helper --gui si se puede (para poder usarlo en la descarga)
+    if IS_MAC and use_gui and shutil.which("swiftc") and (RT/'saml-login.swift').exists() and not (RT/'saml-login').exists():
+        try: subprocess.run(["swiftc","-O",str(RT/'saml-login.swift'),"-o",str(RT/'saml-login')],check=True)
+        except Exception: pass
 
-    # localizar el .ovpn
-    src_ovpn = None; src_dir = None
-    if prof_arg:
-        p = Path(prof_arg).expanduser()
-        if p.is_dir(): src_dir = p; g = list(p.glob("*.ovpn")); src_ovpn = g[0] if g else None
-        elif p.suffix == ".ovpn": src_ovpn = p; src_dir = p.parent
+    if do_dl:
+        download_profile(server_arg or DEFAULT_SERVER, use_gui, insecure)
+        src_ovpn = PROF / "client.ovpn"; src_dir = PROF
     else:
-        d = find_profile_dir()
-        if d: src_dir = d; g = list(d.glob("*.ovpn")); src_ovpn = g[0] if g else None
-    if not src_ovpn or not src_ovpn.exists():
-        die("No encontre tu perfil .ovpn. Instala/conecta una vez el cliente WatchGuard, "
-            "o pasa la ruta:  usm-vpn setup --profile /ruta/a/tu/perfil")
-
-    text = src_ovpn.read_text(errors="ignore")
-    shutil.copy(src_ovpn, PROF / "client.ovpn")
-    for ref in parse_refs(text):              # copiar certs referenciados (si no van inline)
-        rp = (src_dir / ref) if src_dir else Path(ref)
-        if rp.exists(): shutil.copy(rp, PROF / Path(ref).name)
+        # localizar el .ovpn local (instalacion WatchGuard existente)
+        src_ovpn = None; src_dir = None
+        if prof_arg:
+            p = Path(prof_arg).expanduser()
+            if p.is_dir(): src_dir = p; g = list(p.glob("*.ovpn")); src_ovpn = g[0] if g else None
+            elif p.suffix == ".ovpn": src_ovpn = p; src_dir = p.parent
+        else:
+            d = find_profile_dir()
+            if d: src_dir = d; g = list(d.glob("*.ovpn")); src_ovpn = g[0] if g else None
+        if not src_ovpn or not src_ovpn.exists():
+            die("No encontre tu perfil .ovpn.\n"
+                "  - Con WatchGuard instalado (Mac/Win):  usm-vpn setup\n"
+                "  - Sin WatchGuard (Linux, etc.):        usm-vpn setup --download\n"
+                "  - Con un .ovpn a mano:                 usm-vpn setup --profile <ruta>")
+        if src_ovpn.resolve() != (PROF/"client.ovpn").resolve():
+            shutil.copy(src_ovpn, PROF / "client.ovpn")
+        for ref in parse_refs(src_ovpn.read_text(errors="ignore")):
+            rp = (src_dir / ref) if src_dir else Path(ref)
+            if rp.exists() and rp.resolve() != (PROF/Path(ref).name).resolve():
+                shutil.copy(rp, PROF / Path(ref).name)
 
     # quitar auth-user-pass interactivo (lo damos por archivo)
     txt = (PROF / "client.ovpn").read_text(errors="ignore")
@@ -93,8 +144,7 @@ def cmd_setup(args):
     (PROF / "client.ovpn").write_text(txt)
 
     m = re.search(r'^\s*remote\s+(\S+)', txt, re.M)
-    if not m: die("El perfil no tiene linea 'remote'. ¿Es un .ovpn valido?")
-    server = m.group(1)
+    server = server_arg or (m.group(1) if m else DEFAULT_SERVER)
 
     ovpn = ovpn_arg or find_openvpn()
     cfg = {"server": server, "realm": realm, "openvpn": ovpn}
@@ -326,7 +376,8 @@ def cmd_info(args):
     print("    macOS:   brew install openvpn   (o usa el de WatchGuard)")
     print("    Linux:   sudo apt install openvpn   /   sudo dnf install openvpn")
     print("    Windows: winget install OpenVPN.OpenVPN  (ejecuta la terminal como Administrador)")
-    print("\n  Nota: necesitas TU propio perfil (.ovpn + certificados) de tu cuenta USM.")
+    print("\n  Perfil: si NO tienes WatchGuard (Linux), descarga el tuyo con:")
+    print("          usm-vpn setup --download        (hara login SAML y lo baja del Firebox)")
 
 def main():
     cmds = {"setup":cmd_setup,"connect":cmd_connect,"disconnect":cmd_disconnect,
@@ -336,7 +387,9 @@ def main():
         print("     usm-vpn connect [--gui]        (--gui solo en Mac)")
         print("     usm-vpn reconnect [--gui]      desconecta y vuelve a conectar")
         print("     usm-vpn clean                  mata cualquier tunel huerfano (cierre de emergencia)")
-        print("     usm-vpn setup [--profile RUTA] [--openvpn RUTA] [--realm NOMBRE]")
+        print("     usm-vpn setup                  autodetecta perfil de WatchGuard (Mac/Win)")
+        print("     usm-vpn setup --download [--gui]  descarga tu perfil via SAML (Linux/sin WatchGuard)")
+        print("     usm-vpn setup --profile RUTA   usa un .ovpn que ya tengas")
         sys.exit(0 if len(sys.argv)<2 else 1)
     cmds[sys.argv[1]](sys.argv[2:])
 

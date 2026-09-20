@@ -15,7 +15,10 @@ Funciona en **macOS, Linux y Windows**.
    - macOS: `brew install openvpn` (o se usa el que ya trae WatchGuard).
    - Linux: `sudo apt install openvpn` / `sudo dnf install openvpn`.
    - Windows: `winget install OpenVPN.OpenVPN`.
-3. **Tu perfil USM** (`.ovpn` + certificados). Si tienes el cliente WatchGuard instalado y ya conectaste una vez, `setup` lo detecta solo. Si no, expórtalo del portal y pásalo con `--profile`.
+3. **Tu perfil USM** (`.ovpn` + certificados). Tres formas de obtenerlo:
+   - **Con WatchGuard instalado** (macOS/Windows) y ya conectaste una vez: `usm-vpn setup` lo detecta solo.
+   - **Sin WatchGuard** (Linux, o instalación limpia): `usm-vpn setup --download` — hace el login SAML y **descarga tu perfil** directamente del Firebox. En Linux usa el flujo de pegar la URL; en macOS puedes añadir `--gui`.
+   - **Con un `.ovpn` a mano**: `usm-vpn setup --profile /ruta/a/tu/perfil`.
 
 ## Instalación
 **macOS / Linux:**
